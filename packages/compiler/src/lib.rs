@@ -358,6 +358,21 @@ impl TypstCompiler {
         w.query(0, selector, field)
     }
 
+    /// core-tylor: resolve the layout position(s) of a source cursor
+    /// (editor → preview jump, like the official typst.app).
+    /// `cursor_utf16` is a UTF-16 offset into `file_path` (CodeMirror native).
+    /// Returns `[{ page, x, y }]` with `x`/`y` in pt. Compilation is
+    /// comemo-cached, so this is cheap right after a regular compile.
+    pub fn jump_from_cursor(
+        &mut self,
+        main_file_path: String,
+        file_path: String,
+        cursor_utf16: u32,
+    ) -> Result<JsValue, JsValue> {
+        let mut w = self.snapshot(None, Some(main_file_path), None)?;
+        w.jump_from_cursor(file_path, cursor_utf16)
+    }
+
     #[cfg(feature = "incr")]
     pub fn create_incr_server(&mut self) -> Result<IncrServer, JsValue> {
         Ok(IncrServer::default())
@@ -466,6 +481,40 @@ impl TypstCompileWorld {
             .collect();
 
         Ok(serde_json::to_string_pretty(&mapped).map_err(|e| format!("{e:?}"))?)
+    }
+
+    /// core-tylor: see `TypstCompiler::jump_from_cursor`.
+    pub fn jump_from_cursor(
+        &mut self,
+        file_path: String,
+        cursor_utf16: u32,
+    ) -> Result<JsValue, JsValue> {
+        let Some(doc) = self.do_compile_paged()? else {
+            return Err(error_once!("document did not compile").into());
+        };
+
+        let id = typst::syntax::FileId::new(
+            None,
+            typst::syntax::VirtualPath::new(Path::new(&file_path)),
+        );
+        let source = TypstWorld::source(&self.graph.snap.world, id)
+            .map_err(|e| JsValue::from(format!("{e:?}")))?;
+        let cursor = source
+            .lines()
+            .utf16_to_byte(cursor_utf16 as usize)
+            .unwrap_or_else(|| source.text().len());
+
+        let positions = typst_ide::jump_from_cursor(&doc, &source, cursor);
+
+        let arr = js_sys::Array::new();
+        for pos in positions {
+            let obj = js_sys::Object::new();
+            js_sys::Reflect::set(&obj, &"page".into(), &(pos.page.get() as u32).into())?;
+            js_sys::Reflect::set(&obj, &"x".into(), &pos.point.x.to_pt().into())?;
+            js_sys::Reflect::set(&obj, &"y".into(), &pos.point.y.to_pt().into())?;
+            arr.push(&obj);
+        }
+        Ok(arr.into())
     }
 
     #[cfg(feature = "incr")]

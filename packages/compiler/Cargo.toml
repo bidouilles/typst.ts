@@ -40,6 +40,7 @@ reflexo-typst2vec.workspace = true
 reflexo-typst = { workspace = true, features = ["web"] }
 reflexo-vec2svg.workspace = true
 typst.workspace = true
+typst-ide.workspace = true
 typst-assets = { workspace = true, optional = true }
 
 [dev-dependencies]
