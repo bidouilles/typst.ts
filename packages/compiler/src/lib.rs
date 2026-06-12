@@ -493,10 +493,17 @@ impl TypstCompileWorld {
             return Err(error_once!("document did not compile").into());
         };
 
-        let id = typst::syntax::FileId::new(
-            None,
-            typst::syntax::VirtualPath::new(Path::new(&file_path)),
-        );
+        // Resolve the path the same way snapshot() selects entries — reflexo
+        // roots FileIds in the workspace (WorkspaceResolver), so a plain
+        // FileId::new(None, ..) would miss the vfs and yield AccessDenied.
+        let id = self
+            .graph
+            .snap
+            .world
+            .entry_state()
+            .try_select_path_in_workspace(Path::new(&file_path))?
+            .and_then(|entry| entry.main())
+            .ok_or_else(|| error_once!("failed to select path", path: file_path))?;
         let source = TypstWorld::source(&self.graph.snap.world, id)
             .map_err(|e| JsValue::from(format!("{e:?}")))?;
         let cursor = source
