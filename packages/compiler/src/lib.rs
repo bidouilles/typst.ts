@@ -373,6 +373,33 @@ impl TypstCompiler {
         w.jump_from_cursor(file_path, cursor_utf16)
     }
 
+    /// core-tylor: typst-ide autocompletion at a UTF-16 cursor offset.
+    /// Returns a JSON string `{"from": <utf16 offset>, "completions": [..]}`
+    /// (typst-ide's serde shapes) or JS null when nothing applies. `explicit`
+    /// means the user invoked completion manually (Ctrl+Space).
+    pub fn autocomplete(
+        &mut self,
+        main_file_path: String,
+        file_path: String,
+        cursor_utf16: u32,
+        explicit: bool,
+    ) -> Result<JsValue, JsValue> {
+        let mut w = self.snapshot(None, Some(main_file_path), None)?;
+        w.autocomplete(file_path, cursor_utf16, explicit)
+    }
+
+    /// core-tylor: typst-ide hover tooltip at a UTF-16 cursor offset.
+    /// Returns a JSON string `{"kind": "text"|"code", "value": ".."}` or null.
+    pub fn tooltip(
+        &mut self,
+        main_file_path: String,
+        file_path: String,
+        cursor_utf16: u32,
+    ) -> Result<JsValue, JsValue> {
+        let mut w = self.snapshot(None, Some(main_file_path), None)?;
+        w.tooltip(file_path, cursor_utf16)
+    }
+
     #[cfg(feature = "incr")]
     pub fn create_incr_server(&mut self) -> Result<IncrServer, JsValue> {
         Ok(IncrServer::default())
@@ -394,6 +421,57 @@ impl TypstCompiler {
 type CFlag<D> = FlagTask<CompilationTask<D>>;
 type PagedCFlag = CFlag<reflexo_typst::TypstPagedDocument>;
 type HtmlCFlag = CFlag<reflexo_typst::TypstHtmlDocument>;
+
+/// core-tylor: minimal IdeWorld adapter over the browser CompilerWorld —
+/// typst-ide's entry points take an `&dyn IdeWorld`, a trait reflexo doesn't
+/// implement. `files()` (which powers path completions in `#image`/`#include`)
+/// lists the vfs shadow files, i.e. exactly the project files the app mapped.
+struct IdeWorldShim<'a>(&'a world::CompilerWorld<BrowserCompilerFeat>);
+
+impl ::typst::World for IdeWorldShim<'_> {
+    fn library(&self) -> &::typst::utils::LazyHash<::typst::Library> {
+        self.0.library()
+    }
+    fn book(&self) -> &::typst::utils::LazyHash<::typst::text::FontBook> {
+        self.0.book()
+    }
+    fn main(&self) -> ::typst::syntax::FileId {
+        self.0.main()
+    }
+    fn source(&self, id: ::typst::syntax::FileId) -> ::typst::diag::FileResult<::typst::syntax::Source> {
+        self.0.source(id)
+    }
+    fn file(&self, id: ::typst::syntax::FileId) -> ::typst::diag::FileResult<::typst::foundations::Bytes> {
+        self.0.file(id)
+    }
+    fn font(&self, index: usize) -> Option<::typst::text::Font> {
+        self.0.font(index)
+    }
+    fn today(&self, offset: Option<i64>) -> Option<::typst::foundations::Datetime> {
+        self.0.today(offset)
+    }
+}
+
+impl typst_ide::IdeWorld for IdeWorldShim<'_> {
+    fn upcast(&self) -> &dyn ::typst::World {
+        self.0
+    }
+
+    fn files(&self) -> Vec<::typst::syntax::FileId> {
+        let entry = self.0.entry_state();
+        self.0
+            .shadow_paths()
+            .into_iter()
+            .filter_map(|path| {
+                entry
+                    .try_select_path_in_workspace(&path)
+                    .ok()
+                    .flatten()
+                    .and_then(|e| e.main())
+            })
+            .collect()
+    }
+}
 
 #[wasm_bindgen]
 pub struct TypstCompileWorld {
@@ -483,6 +561,22 @@ impl TypstCompileWorld {
         Ok(serde_json::to_string_pretty(&mapped).map_err(|e| format!("{e:?}"))?)
     }
 
+    /// core-tylor: resolve a workspace path to its Source. Reflexo roots
+    /// FileIds in the workspace (WorkspaceResolver), so a plain
+    /// FileId::new(None, ..) would miss the vfs and yield AccessDenied.
+    fn select_source(&self, file_path: &str) -> Result<typst::syntax::Source, JsValue> {
+        let id = self
+            .graph
+            .snap
+            .world
+            .entry_state()
+            .try_select_path_in_workspace(Path::new(file_path))?
+            .and_then(|entry| entry.main())
+            .ok_or_else(|| error_once!("failed to select path", path: file_path))?;
+        TypstWorld::source(&self.graph.snap.world, id)
+            .map_err(|e| JsValue::from(format!("{e:?}")))
+    }
+
     /// core-tylor: see `TypstCompiler::jump_from_cursor`.
     pub fn jump_from_cursor(
         &mut self,
@@ -493,19 +587,7 @@ impl TypstCompileWorld {
             return Err(error_once!("document did not compile").into());
         };
 
-        // Resolve the path the same way snapshot() selects entries — reflexo
-        // roots FileIds in the workspace (WorkspaceResolver), so a plain
-        // FileId::new(None, ..) would miss the vfs and yield AccessDenied.
-        let id = self
-            .graph
-            .snap
-            .world
-            .entry_state()
-            .try_select_path_in_workspace(Path::new(&file_path))?
-            .and_then(|entry| entry.main())
-            .ok_or_else(|| error_once!("failed to select path", path: file_path))?;
-        let source = TypstWorld::source(&self.graph.snap.world, id)
-            .map_err(|e| JsValue::from(format!("{e:?}")))?;
+        let source = self.select_source(&file_path)?;
         let cursor = source
             .lines()
             .utf16_to_byte(cursor_utf16 as usize)
@@ -522,6 +604,62 @@ impl TypstCompileWorld {
             arr.push(&obj);
         }
         Ok(arr.into())
+    }
+
+    /// core-tylor: see `TypstCompiler::autocomplete`.
+    pub fn autocomplete(
+        &mut self,
+        file_path: String,
+        cursor_utf16: u32,
+        explicit: bool,
+    ) -> Result<JsValue, JsValue> {
+        // Completions are richer with a compiled document (labels, show rules)
+        // but must still work while the source has errors — tolerate failure.
+        let doc = self.do_compile_paged().ok().flatten();
+        let source = self.select_source(&file_path)?;
+        let cursor = source
+            .lines()
+            .utf16_to_byte(cursor_utf16 as usize)
+            .unwrap_or_else(|| source.text().len());
+
+        let shim = IdeWorldShim(&self.graph.snap.world);
+        let Some((from, completions)) =
+            typst_ide::autocomplete(&shim, doc.as_deref(), &source, cursor, explicit)
+        else {
+            return Ok(JsValue::NULL);
+        };
+
+        let from_utf16 = source.lines().byte_to_utf16(from).unwrap_or(0);
+        let payload = serde_json::json!({ "from": from_utf16, "completions": completions });
+        Ok(JsValue::from_str(&payload.to_string()))
+    }
+
+    /// core-tylor: see `TypstCompiler::tooltip`.
+    pub fn tooltip(&mut self, file_path: String, cursor_utf16: u32) -> Result<JsValue, JsValue> {
+        let doc = self.do_compile_paged().ok().flatten();
+        let source = self.select_source(&file_path)?;
+        let cursor = source
+            .lines()
+            .utf16_to_byte(cursor_utf16 as usize)
+            .unwrap_or_else(|| source.text().len());
+
+        let shim = IdeWorldShim(&self.graph.snap.world);
+        let Some(tooltip) = typst_ide::tooltip(
+            &shim,
+            doc.as_deref(),
+            &source,
+            cursor,
+            typst::syntax::Side::Before,
+        ) else {
+            return Ok(JsValue::NULL);
+        };
+
+        let (kind, value) = match tooltip {
+            typst_ide::Tooltip::Text(text) => ("text", text),
+            typst_ide::Tooltip::Code(code) => ("code", code),
+        };
+        let payload = serde_json::json!({ "kind": kind, "value": value });
+        Ok(JsValue::from_str(&payload.to_string()))
     }
 
     #[cfg(feature = "incr")]
