@@ -400,6 +400,24 @@ impl TypstCompiler {
         w.tooltip(file_path, cursor_utf16)
     }
 
+    /// core-tylor: typst-ide jump_from_click — the inverse of
+    /// `jump_from_cursor` (preview → editor jump, like typst.app). Given a
+    /// click at (`x`, `y`) in **pt** on 1-based `page`, returns where to jump:
+    ///   `{ "kind": "source", "file": "/path", "offset": <utf16> }`
+    ///   `{ "kind": "url", "url": ".." }`
+    ///   `{ "kind": "position", "page": <1-based>, "x": <pt>, "y": <pt> }`
+    /// or JS null when the click maps to nothing (margins, generated content).
+    pub fn jump_from_click(
+        &mut self,
+        main_file_path: String,
+        page: u32,
+        x: f64,
+        y: f64,
+    ) -> Result<JsValue, JsValue> {
+        let mut w = self.snapshot(None, Some(main_file_path), None)?;
+        w.jump_from_click(page, x, y)
+    }
+
     #[cfg(feature = "incr")]
     pub fn create_incr_server(&mut self) -> Result<IncrServer, JsValue> {
         Ok(IncrServer::default())
@@ -604,6 +622,49 @@ impl TypstCompileWorld {
             arr.push(&obj);
         }
         Ok(arr.into())
+    }
+
+    /// core-tylor: see `TypstCompiler::jump_from_click`.
+    pub fn jump_from_click(&mut self, page: u32, x: f64, y: f64) -> Result<JsValue, JsValue> {
+        let Some(doc) = self.do_compile_paged()? else {
+            return Err(error_once!("document did not compile").into());
+        };
+
+        // `page` is 1-based (matches `jump_from_cursor`'s output).
+        let Some(page_obj) = doc.pages.get((page as usize).saturating_sub(1)) else {
+            return Ok(JsValue::NULL);
+        };
+        let click =
+            ::typst::layout::Point::new(::typst::layout::Abs::pt(x), ::typst::layout::Abs::pt(y));
+
+        let shim = IdeWorldShim(&self.graph.snap.world);
+        let Some(jump) = typst_ide::jump_from_click(&shim, &doc, &page_obj.frame, click) else {
+            return Ok(JsValue::NULL);
+        };
+
+        let obj = js_sys::Object::new();
+        match jump {
+            typst_ide::Jump::File(id, offset) => {
+                let source = TypstWorld::source(&self.graph.snap.world, id)
+                    .map_err(|e| JsValue::from(format!("{e:?}")))?;
+                let offset_utf16 = source.lines().byte_to_utf16(offset).unwrap_or(0);
+                let path = id.vpath().as_rooted_path().to_string_lossy().into_owned();
+                js_sys::Reflect::set(&obj, &"kind".into(), &"source".into())?;
+                js_sys::Reflect::set(&obj, &"file".into(), &path.into())?;
+                js_sys::Reflect::set(&obj, &"offset".into(), &(offset_utf16 as u32).into())?;
+            }
+            typst_ide::Jump::Url(url) => {
+                js_sys::Reflect::set(&obj, &"kind".into(), &"url".into())?;
+                js_sys::Reflect::set(&obj, &"url".into(), &url.into_inner().as_str().into())?;
+            }
+            typst_ide::Jump::Position(pos) => {
+                js_sys::Reflect::set(&obj, &"kind".into(), &"position".into())?;
+                js_sys::Reflect::set(&obj, &"page".into(), &(pos.page.get() as u32).into())?;
+                js_sys::Reflect::set(&obj, &"x".into(), &pos.point.x.to_pt().into())?;
+                js_sys::Reflect::set(&obj, &"y".into(), &pos.point.y.to_pt().into())?;
+            }
+        }
+        Ok(obj.into())
     }
 
     /// core-tylor: see `TypstCompiler::autocomplete`.
