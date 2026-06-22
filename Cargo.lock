@@ -5817,6 +5817,7 @@ dependencies = [
  "sha2",
  "typst",
  "typst-assets 0.14.2 (git+https://github.com/typst/typst-assets?rev=955ae8d)",
+ "typst-ide",
  "typst-ts-test-common",
  "wasm-bindgen",
  "wasm-bindgen-futures",

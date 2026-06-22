@@ -465,7 +465,10 @@ impl ::typst::World for IdeWorldShim<'_> {
     fn font(&self, index: usize) -> Option<::typst::text::Font> {
         self.0.font(index)
     }
-    fn today(&self, offset: Option<i64>) -> Option<::typst::foundations::Datetime> {
+    fn today(
+        &self,
+        offset: Option<::typst::foundations::Duration>,
+    ) -> Option<::typst::foundations::Datetime> {
         self.0.today(offset)
     }
 }
@@ -611,7 +614,7 @@ impl TypstCompileWorld {
             .utf16_to_byte(cursor_utf16 as usize)
             .unwrap_or_else(|| source.text().len());
 
-        let positions = typst_ide::jump_from_cursor(&doc, &source, cursor);
+        let positions = typst_ide::jump_from_cursor(&*doc, &source, cursor);
 
         let arr = js_sys::Array::new();
         for pos in positions {
@@ -630,15 +633,17 @@ impl TypstCompileWorld {
             return Err(error_once!("document did not compile").into());
         };
 
-        // `page` is 1-based (matches `jump_from_cursor`'s output).
-        let Some(page_obj) = doc.pages.get((page as usize).saturating_sub(1)) else {
+        // `page` is 1-based (matches `jump_from_cursor`'s output); typst-ide's
+        // `resolve_position` does the page-bounds lookup internally.
+        let Some(page_nz) = std::num::NonZeroUsize::new(page as usize) else {
             return Ok(JsValue::NULL);
         };
         let click =
             ::typst::layout::Point::new(::typst::layout::Abs::pt(x), ::typst::layout::Abs::pt(y));
+        let position = ::typst::introspection::PagedPosition { page: page_nz, point: click };
 
         let shim = IdeWorldShim(&self.graph.snap.world);
-        let Some(jump) = typst_ide::jump_from_click(&shim, &doc, &page_obj.frame, click) else {
+        let Some(jump) = typst_ide::jump_from_click(&shim, &*doc, &position) else {
             return Ok(JsValue::NULL);
         };
 
@@ -648,7 +653,7 @@ impl TypstCompileWorld {
                 let source = TypstWorld::source(&self.graph.snap.world, id)
                     .map_err(|e| JsValue::from(format!("{e:?}")))?;
                 let offset_utf16 = source.lines().byte_to_utf16(offset).unwrap_or(0);
-                let path = id.vpath().as_rooted_path().to_string_lossy().into_owned();
+                let path = id.vpath().get_with_slash().to_string();
                 js_sys::Reflect::set(&obj, &"kind".into(), &"source".into())?;
                 js_sys::Reflect::set(&obj, &"file".into(), &path.into())?;
                 js_sys::Reflect::set(&obj, &"offset".into(), &(offset_utf16 as u32).into())?;
